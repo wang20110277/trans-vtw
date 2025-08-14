@@ -7,6 +7,7 @@
       <!-- 左侧数字人画面 -->
       <div class="avatar-panel">
         <div id="video-container">
+          <video id="remote-video" autoplay playsinline style="display: none;"></video>
           <img id="avatar-image" src="/assets/images/aya.png" alt="阿雅数字人">
           <div id="initial-message" style="display: none;">数字人画面区域</div>
         </div>
@@ -38,202 +39,226 @@
           <button :class="['record-btn', {recording: isRecording}]" @click="toggleRecording">
             <i :class="isRecording ? 'fas fa-stop' : 'fas fa-microphone'"></i>
           </button>
+          <button class="video-call-btn" @click="startVideoCall" :disabled="!isConnected || isCallActive">
+            <i class="fas fa-video"></i>
+          </button>
         </div>
       </div>
     </div>
   </div>
 </template>
 
-<script>
-export default {
-  name: 'App',
-  data() {
-    return {
-      userId: 'user_' + Math.random().toString(36).substr(2, 9),
-      socket: null,
-      isConnected: false,
-      reconnectAttempts: 0,
-      maxReconnectAttempts: 5,
-      dialogue: [],
-      newMessage: '',
-      isRecording: false,
-      connectionStatusElement: null
+<script setup lang="ts">
+import { ref, onMounted, nextTick, watch } from 'vue';
+import { WebRTCManager } from './webrtc';
+
+const userId = 'user_' + Math.random().toString(36).substr(2, 9);
+let socket: WebSocket | null = null;
+const isConnected = ref(false);
+const reconnectAttempts = ref(0);
+const maxReconnectAttempts = 5;
+const dialogue = ref<{role?: string; content?: string; timestamp?: number}[]>([]);
+const newMessage = ref('');
+const isRecording = ref(false);
+const connectionStatusElement = ref<HTMLElement | null>(null);
+const isCallActive = ref(false);
+let webRTCManager: WebRTCManager | null = null;
+
+const updateConnectionStatus = (status: string, text: string) => {
+  if (connectionStatusElement.value) {
+    connectionStatusElement.value.className = 'connection-status ' + status;
+    connectionStatusElement.value.textContent = text;
+  }
+};
+
+const connectWebSocket = () => {
+  // 如果已达到最大重连次数，停止重连
+  if (reconnectAttempts.value >= maxReconnectAttempts) {
+    updateConnectionStatus('disconnected', '连接失败，请刷新页面重试');
+    return;
+  }
+  
+  const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const wsUrl = `${protocol}${window.location.host}/ws?user_id=${userId}`;
+  
+  try {
+    socket = new WebSocket(wsUrl);
+    updateConnectionStatus('connecting', '连接中...');
+    
+    socket.onopen = (event) => {
+      console.log('WebSocket连接已建立');
+      isConnected.value = true;
+      reconnectAttempts.value = 0; // 重置重连次数
+      updateConnectionStatus('connected', '已连接');
+      
+      // 初始化WebRTC客户端
+      webRTCManager = new WebRTCManager();
+      
+      // 连接建立后显示数字人图片并播放欢迎语音
+      showAvatarAndGreet();
     };
-  },
-  mounted() {
-    // 创建连接状态显示元素
-    this.connectionStatusElement = document.createElement('div');
-    this.connectionStatusElement.id = 'connection-status';
-    this.connectionStatusElement.className = 'connection-status connecting';
-    this.connectionStatusElement.textContent = '连接中...';
-    document.body.appendChild(this.connectionStatusElement);
     
-    // 连接WebSocket
-    this.connectWebSocket();
-    
-    // 每30秒发送一次心跳包
-    setInterval(this.sendPing, 30000);
-  },
-  watch: {
-    dialogue() {
-      // 在对话更新时滚动到底部
-      this.$nextTick(() => {
-        const container = this.$refs.dialogueContainer;
-        if (container) {
-          container.scrollTop = container.scrollHeight;
-        }
-      });
-    }
-  },
-  methods: {
-    updateConnectionStatus(status, text) {
-      if (this.connectionStatusElement) {
-        this.connectionStatusElement.className = 'connection-status ' + status;
-        this.connectionStatusElement.textContent = text;
-      }
-    },
-    
-    connectWebSocket() {
-      // 如果已达到最大重连次数，停止重连
-      if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-        this.updateConnectionStatus('disconnected', '连接失败，请刷新页面重试');
-        return;
-      }
-      
-      const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-      const wsUrl = `${protocol}${window.location.host}/ws?user_id=${this.userId}`;
-      
+    socket.onmessage = (event) => {
       try {
-        this.socket = new WebSocket(wsUrl);
-        this.updateConnectionStatus('connecting', '连接中...');
-        
-        this.socket.onopen = (event) => {
-          console.log('WebSocket连接已建立');
-          this.isConnected = true;
-          this.reconnectAttempts = 0; // 重置重连次数
-          this.updateConnectionStatus('connected', '已连接');
-          
-          // 连接建立后显示数字人图片并播放欢迎语音
-          this.showAvatarAndGreet();
-        };
-        
-        this.socket.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            this.handleServerMessage(data);
-          } catch (e) {
-            console.error('解析服务器消息失败:', e);
-          }
-        };
-        
-        this.socket.onclose = (event) => {
-          console.log('WebSocket连接已断开');
-          this.isConnected = false;
-          this.updateConnectionStatus('disconnected', '连接已断开');
-          
-          // 尝试重新连接，增加重连次数
-          this.reconnectAttempts++;
-          const reconnectDelay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000); // 指数退避，最大10秒
-          console.log(`尝试重新连接 (${this.reconnectAttempts}/${this.maxReconnectAttempts})，${reconnectDelay}ms 后重试`);
-          setTimeout(this.connectWebSocket, reconnectDelay);
-        };
-        
-        this.socket.onerror = (error) => {
-          console.error('WebSocket错误:', error);
-          this.updateConnectionStatus('disconnected', '连接错误');
-        };
+        const data = JSON.parse(event.data);
+        handleServerMessage(data);
       } catch (e) {
-        console.error('WebSocket连接失败:', e);
-        this.updateConnectionStatus('disconnected', '连接失败');
-        
-        // 尝试重新连接
-        this.reconnectAttempts++;
-        const reconnectDelay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000);
-        console.log(`连接失败，${reconnectDelay}ms 后重试 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-        setTimeout(this.connectWebSocket, reconnectDelay);
+        console.error('解析服务器消息失败:', e);
       }
-    },
+    };
     
-    handleServerMessage(data) {
-      switch (data.type) {
-        case 'update_dialogue':
-          this.dialogue = data.data;
-          break;
-        case 'pong':
-          // 心跳响应
-          break;
-        default:
-          console.log('未知消息类型:', data.type);
-      }
-    },
-    
-    sendMessage() {
-      if (!this.isConnected || !this.newMessage.trim()) return;
+    socket.onclose = (event) => {
+      console.log('WebSocket连接已断开');
+      isConnected.value = false;
+      updateConnectionStatus('disconnected', '连接已断开');
       
-      const message = {
-        type: 'message',
-        role: 'user',
-        content: this.newMessage.trim()
-      };
-      
-      try {
-        this.socket.send(JSON.stringify(message));
-        this.newMessage = '';
-      } catch (e) {
-        console.error('发送消息失败:', e);
-        alert('发送消息失败，请重试');
+      // 尝试重新连接，增加重连次数
+      reconnectAttempts.value++;
+      const reconnectDelay = Math.min(1000 * Math.pow(2, reconnectAttempts.value), 10000); // 指数退避，最大10秒
+      console.log(`尝试重新连接 (${reconnectAttempts.value}/${maxReconnectAttempts})，${reconnectDelay}ms 后重试`);
+      setTimeout(connectWebSocket, reconnectDelay);
+    };
+    
+    socket.onerror = (error) => {
+      console.error('WebSocket错误:', error);
+      updateConnectionStatus('disconnected', '连接错误');
+    };
+  } catch (e) {
+    console.error('WebSocket连接失败:', e);
+    updateConnectionStatus('disconnected', '连接失败');
+    
+    // 尝试重新连接
+    reconnectAttempts.value++;
+    const reconnectDelay = Math.min(1000 * Math.pow(2, reconnectAttempts.value), 10000);
+    console.log(`连接失败，${reconnectDelay}ms 后重试 (${reconnectAttempts.value}/${maxReconnectAttempts})`);
+    setTimeout(connectWebSocket, reconnectDelay);
+  }
+};
+
+const handleServerMessage = (data: any) => {
+  switch (data.type) {
+    case 'update_dialogue':
+      dialogue.value = data.data;
+      break;
+    case 'pong':
+      // 心跳响应
+      break;
+    case 'offer':
+    case 'answer':
+    case 'ice-candidate':
+      // 处理WebRTC信令消息
+      if (webRTCManager) {
+        webRTCManager.handleSignalingMessage(data);
       }
-    },
-    
-    sendPing() {
-      if (this.isConnected) {
-        try {
-          this.socket.send(JSON.stringify({type: 'ping'}));
-        } catch (e) {
-          console.error('发送心跳包失败:', e);
-        }
-      }
-    },
-    
-    toggleRecording() {
-      this.isRecording = !this.isRecording;
-      // 这里可以添加实际的录音逻辑
-    },
-    
-    showAvatarAndGreet() {
-      // 显示数字人图片
-      this.showAvatar();
-      
-      // 播放欢迎语音
-      this.speakWelcomeMessage();
-    },
-    
-    showAvatar() {
-      // 显示数字人图片
-      const avatarImage = document.getElementById('avatar-image');
-      const initialMessage = document.getElementById('initial-message');
-      
-      if (avatarImage && initialMessage) {
-        initialMessage.style.display = 'none';
-        avatarImage.style.display = 'block';
-      }
-    },
-    
-    speakWelcomeMessage() {
-      // 创建音频上下文播放欢迎语音
-      const welcomeText = "你好，我是阿雅，您的的专属理财顾问，有什么可以帮助您？";
-      const utterance = new SpeechSynthesisUtterance(welcomeText);
-      utterance.lang = 'zh-CN';
-      utterance.rate = 1;
-      utterance.pitch = 1;
-      speechSynthesis.speak(utterance);
-    },
-    
-    formatTime(timestamp) {
-      return new Date().toLocaleTimeString();
+      break;
+    default:
+      console.log('未知消息类型:', data.type);
+  }
+};
+
+const sendMessage = () => {
+  if (!isConnected.value || !newMessage.value.trim()) return;
+  
+  const message = {
+    type: 'message',
+    role: 'user',
+    content: newMessage.value.trim()
+  };
+  
+  try {
+    socket!.send(JSON.stringify(message));
+    newMessage.value = '';
+  } catch (e) {
+    console.error('发送消息失败:', e);
+    alert('发送消息失败，请重试');
+  }
+};
+
+const sendPing = () => {
+  if (isConnected.value) {
+    try {
+      socket!.send(JSON.stringify({type: 'ping'}));
+    } catch (e) {
+      console.error('发送心跳包失败:', e);
     }
   }
 };
+
+const toggleRecording = () => {
+  isRecording.value = !isRecording.value;
+  // 这里可以添加实际的录音逻辑
+};
+
+const showAvatarAndGreet = () => {
+  // 显示数字人图片
+  showAvatar();
+  
+  // 播放欢迎语音
+  speakWelcomeMessage();
+};
+
+const showAvatar = () => {
+  // 显示数字人图片
+  const avatarImage = document.getElementById('avatar-image');
+  const initialMessage = document.getElementById('initial-message');
+  
+  if (avatarImage && initialMessage) {
+    initialMessage.style.display = 'none';
+    avatarImage.style.display = 'block';
+  }
+};
+
+const speakWelcomeMessage = () => {
+  // 创建音频上下文播放欢迎语音
+  const welcomeText = "你好，我是阿雅，您的的专属理财顾问，有什么可以帮助您？";
+  const utterance = new SpeechSynthesisUtterance(welcomeText);
+  utterance.lang = 'zh-CN';
+  utterance.rate = 1;
+  utterance.pitch = 1;
+  speechSynthesis.speak(utterance);
+};
+
+const formatTime = (timestamp: number) => {
+  return new Date().toLocaleTimeString();
+};
+
+const startVideoCall = async () => {
+  if (!webRTCManager) return;
+  
+  try {
+    isCallActive.value = true;
+    await webRTCManager.startCall();
+  } catch (error) {
+    console.error('启动视频通话失败:', error);
+    isCallActive.value = false;
+    alert('启动视频通话失败，请重试');
+  }
+};
+
+onMounted(() => {
+  // 创建连接状态显示元素
+  connectionStatusElement.value = document.createElement('div');
+  connectionStatusElement.value.id = 'connection-status';
+  connectionStatusElement.value.className = 'connection-status connecting';
+  connectionStatusElement.value.textContent = '连接中...';
+  document.body.appendChild(connectionStatusElement.value);
+  
+  // 连接WebSocket
+  connectWebSocket();
+  
+  // 每30秒发送一次心跳包
+  setInterval(sendPing, 30000);
+});
+
+watch(dialogue, () => {
+  // 在对话更新时滚动到底部
+  nextTick(() => {
+    const container = document.querySelector('.dialogue-container');
+    if (container) {
+      container.scrollTop = container.scrollHeight;
+    }
+  });
+});
 </script>
 
 <style>
@@ -337,6 +362,13 @@ header {
 #avatar-image {
   max-width: 100%;
   max-height: 100%;
+  object-fit: contain;
+  border-radius: 10px;
+}
+
+#remote-video {
+  width: 100%;
+  height: 100%;
   object-fit: contain;
   border-radius: 10px;
 }
@@ -466,7 +498,7 @@ header {
   cursor: not-allowed;
 }
 
-.record-btn {
+.record-btn, .video-call-btn {
   padding: 12px 24px;
   background: var(--primary-color);
   color: white;
@@ -476,7 +508,7 @@ header {
   transition: all 0.3s;
 }
 
-.record-btn:hover {
+.record-btn:hover, .video-call-btn:hover {
   background: #0069d9;
 }
 
@@ -542,7 +574,7 @@ h1 {
     font-size: 14px;
   }
   
-  .send-btn, .record-btn {
+  .send-btn, .record-btn, .video-call-btn {
     padding: 10px 20px;
   }
 }
